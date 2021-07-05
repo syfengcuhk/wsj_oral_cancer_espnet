@@ -21,6 +21,12 @@ verbose=0      # verbose option
 resume=        # Resume the training from snapshot
 seed=1
 nj=4
+nj_decode=4
+if_gpu_decoding=false
+ngpu_decode=0
+batchsize_decoding=0
+extra_rec_config="" # e.g. "--ctc-weight 0.3 "
+decode_tag=""
 # feature configuration
 do_delta=false
 
@@ -55,6 +61,9 @@ wsj1=data/wsj/ #/export/corpora5/LDC/LDC94S13B
 # exp tag
 tag="" # tag for managing experiments.
 kaldi_wsj_root=/tudelft.net/staff-bulk/ewi/insy/SpeechLab/siyuanfeng/software/kaldi/egs/relocated_from_DSP/wsj_s5
+test_recog_set="test_dev93 test_eval92"
+test_oc_partition=1
+oc_test_or_train=test
 . utils/parse_options.sh || exit 1;
 
 # Set bash to 'debug' mode, it will exit on :
@@ -162,18 +171,19 @@ fi
 
 # It takes a few days. If you just want to end-to-end ASR without LM,
 # you can skip this by setting skip_lm_training=true
+if [ -z ${lmtag} ]; then
+    lmtag=$(basename ${lm_config%.*})
+    if [ ${use_wordlm} = true ]; then
+        lmtag=${lmtag}_word${lm_vocabsize}
+    fi
+fi
+
+lmexpname=train_rnnlm_${backend}_${lmtag}
+lmexpdir=exp/${lmexpname}
+mkdir -p ${lmexpdir}
 if [ ${stage} -le 3 ] && [ ${stop_stage} -gt 3 ] && ! ${skip_lm_training}; then
     echo "stage 3: LM Preparation"
 
-    if [ -z ${lmtag} ]; then
-        lmtag=$(basename ${lm_config%.*})
-        if [ ${use_wordlm} = true ]; then
-            lmtag=${lmtag}_word${lm_vocabsize}
-        fi
-    fi
-    lmexpname=train_rnnlm_${backend}_${lmtag}
-    lmexpdir=exp/${lmexpname}
-    mkdir -p ${lmexpdir}
 
     if [ ${use_wordlm} = true ]; then
         lmdatadir=data/local/wordlm_train
@@ -264,30 +274,48 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -gt 4 ]; then
         --valid-json ${feat_dt_dir}/data.json
 fi
 
-if [ ${stage} -le 5 ] && [ ${stop_stage} -gt 5 ]; then
-    echo "stage 5: Decoding"
-#    nj=32
-    if [[ $(get_yaml.py ${train_config} model-module) = *transformer* ]] || \
-       [[ $(get_yaml.py ${train_config} model-module) = *conformer* ]] || \
-       [[ $(get_yaml.py ${train_config} model-module) = *maskctc* ]] || \
-       [[ $(get_yaml.py ${train_config} etype) = custom ]] || \
-       [[ $(get_yaml.py ${train_config} dtype) = custom ]]; then
-        average_opts=
-        if ${use_valbest_average}; then
-            recog_model=model.val${n_average}.avg.best
-            average_opts="--log ${expdir}/results/log"
-        else
-            recog_model=model.last${n_average}.avg.best
-        fi
-        average_checkpoints.py --backend ${backend} \
-                               --snapshots ${expdir}/results/snapshot.ep.* \
-                               --out ${expdir}/results/${recog_model} \
-                               --num ${n_average} \
-                               ${average_opts}
+if [[ $(get_yaml.py ${train_config} model-module) = *transformer* ]] || \
+   [[ $(get_yaml.py ${train_config} model-module) = *conformer* ]] || \
+   [[ $(get_yaml.py ${train_config} model-module) = *maskctc* ]] || \
+   [[ $(get_yaml.py ${train_config} etype) = custom ]] || \
+   [[ $(get_yaml.py ${train_config} dtype) = custom ]]; then
+    average_opts=
+    if ${use_valbest_average}; then
+        recog_model=model.val${n_average}.avg.best
+        average_opts="--log ${expdir}/results/log"
+    else
+        recog_model=model.last${n_average}.avg.best
     fi
+fi
+if [ ${stage} -le 5 ] && [ ${stop_stage} -gt 5 ]; then
+    echo "stage 5: Get averaged model: $recog_model; average_opts: $average_opts"
+#    nj=32
+    average_checkpoints.py --backend ${backend} \
+                           --snapshots ${expdir}/results/snapshot.ep.* \
+                           --out ${expdir}/results/${recog_model} \
+                           --num ${n_average} \
+                           ${average_opts}
+fi
 
-    pids=() # initialize pids
-    for rtask in ${recog_set}; do
+nj=$nj_decode
+if $if_gpu_decoding; then
+  ngpu=${ngpu_decode}
+  api=v2
+else
+  # Default:
+  api=v1
+  ngpu=0
+  batchsize_decoding=0
+fi
+
+if [ ${stage} -le 6 ] && [ ${stop_stage} -gt 6 ]; then
+    echo "Decoding: Use GPU to decode: ${if_gpu_decoding}; api: $api"
+    echo "ngpu: ${ngpu}; batch size in decoding: ${batchsize_decoding}"
+    echo "num jobs: $nj" 
+    echo "ASR model: ${expdir}/results/${recog_model}"
+    echo "LM model: ${lmexpdir}/$lang_model"
+#    pids=() # initialize pids
+    for rtask in ${test_recog_set}; do
 #    (
         recog_opts=
         if ${skip_lm_training}; then
@@ -301,15 +329,13 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -gt 5 ]; then
                 recog_opts="--rnnlm ${lmexpdir}/rnnlm.model.best"
             fi
         fi
-
+        echo "Set: $rtask"
         decode_dir=decode_${rtask}_$(basename ${decode_config%.*})_${lmtag}
         feat_recog_dir=${dumpdir}/${rtask}/delta${do_delta}
 
         # split data
         splitjson.py --parts ${nj} ${feat_recog_dir}/data.json
 
-        #### use CPU for decoding
-        ngpu=0
 
         ${decode_cmd} JOB=1:${nj} ${expdir}/${decode_dir}/log/decode.JOB.log \
             asr_recog.py \
@@ -317,6 +343,8 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -gt 5 ]; then
             --ngpu ${ngpu} \
             --backend ${backend} \
             --recog-json ${feat_recog_dir}/split${nj}utt/data.JOB.json \
+            --batchsize $batchsize_decoding \
+            --api $api \
             --result-label ${expdir}/${decode_dir}/data.JOB.json \
             --model ${expdir}/results/${recog_model}  \
             ${recog_opts}
@@ -327,5 +355,83 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -gt 5 ]; then
 #    pids+=($!) # store background pids
     done
 fi
+
+if [ ${stage} -le 7 ] && [ ${stop_stage} -gt 7 ]; then
+    echo "Prepare oral cancer speech test data  of all the 5 partitions"
+    oc_data_root=/tudelft.net/staff-bulk/ewi/insy/SpeechLab/siyuanfeng/software/kaldi/egs/relocated_from_DSP/TUD_for_journal/data_fbank_pitch_for_kaldi_partition_5fold
+    for partition in 1 2 3 4 5; do
+      utils/copy_data_dir.sh  $oc_data_root/$partition/train data/oral_cancer/$partition/train
+      utils/copy_data_dir.sh $oc_data_root/$partition/test data/oral_cancer/$partition/test
+      # Reason: Utterance ID 10130025 has empty transcript so remove this
+      sed -i '/10130025/d' data/oral_cancer/$partition/train/text
+      utils/fix_data_dir.sh data/oral_cancer/$partition/train
+      sed -i '/10130025/d' data/oral_cancer/$partition/test/text
+      utils/fix_data_dir.sh data/oral_cancer/$partition/test
+         
+    done
+
+    echo "Dump features"
+    for partition in 1 2 3 4 5; do
+      for set in train test; do
+        feat_recog_dir=${dumpdir}/oral_cancer/$partition/$set/delta${do_delta}; mkdir -p ${feat_recog_dir}
+        dump.sh --cmd "$train_cmd" --nj 4 --do_delta ${do_delta} \
+            data/oral_cancer/${partition}/$set/feats.scp data/${train_set}/cmvn.ark exp/dump_feats/oral_cancer/$partition/$set \
+            ${feat_recog_dir}
+        data2json.sh --feat ${feat_recog_dir}/feats.scp \
+            --nlsyms ${nlsyms} data/oral_cancer/$partition/$set ${dict} > ${feat_recog_dir}/data.json
+      done
+    done
+
+fi
+
+
+if [ ${stage} -le 8 ] && [ ${stop_stage} -gt 8 ]; then
+  echo "Decoding oral cancer speech"
+  echo "Decoding: Use GPU to decode: ${if_gpu_decoding}; api: $api"
+  echo "ngpu: ${ngpu}; batch size in decoding: ${batchsize_decoding}"
+  echo "num jobs: $nj" 
+  echo "ASR model: ${expdir}/results/${recog_model}"
+  echo "LM model: ${lmexpdir}/$lang_model"
+  for partition_id in ${test_oc_partition}; do
+    recog_opts=
+    if ${skip_lm_training}; then
+        if [ -z ${lmtag} ]; then
+            lmtag="nolm"
+        fi
+    else
+        if [ ${use_wordlm} = true ]; then
+            recog_opts="--word-rnnlm ${lmexpdir}/rnnlm.model.best"
+        else
+            recog_opts="--rnnlm ${lmexpdir}/rnnlm.model.best"
+        fi
+    fi
+    echo "Oral cancer partition ID: $partition_id"
+    if [ "$oc_test_or_train" = "train" ]; then
+      decode_flag=_train
+    else
+      decode_flag=""
+    fi
+    decode_dir=decode_oral_cancer${decode_flag}_${partition_id}_$(basename ${decode_config%.*})_${lmtag}${decode_tag}
+    feat_recog_dir=${dumpdir}/oral_cancer/$partition_id/$oc_test_or_train/delta${do_delta}
+    echo "Test or Train: $oc_test_or_train"
+    echo "Decode dir: $decode_dir; $extra_rec_config"
+    # split data
+    splitjson.py --parts ${nj} ${feat_recog_dir}/data.json
+    ${decode_cmd} JOB=1:${nj} ${expdir}/${decode_dir}/log/decode.JOB.log \
+            asr_recog.py \
+            --config ${decode_config} \
+            --ngpu ${ngpu} \
+            --backend ${backend} \
+            --recog-json ${feat_recog_dir}/split${nj}utt/data.JOB.json \
+            --batchsize $batchsize_decoding \
+            --api $api \
+            --result-label ${expdir}/${decode_dir}/data.JOB.json \
+            --model ${expdir}/results/${recog_model} $extra_rec_config  \
+            ${recog_opts}
+
+        score_sclite.sh --wer true --nlsyms ${nlsyms} ${expdir}/${decode_dir} ${dict} 
+  done
+fi
+
 
 echo "$0: Finished"
